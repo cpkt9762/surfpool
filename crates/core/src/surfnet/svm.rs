@@ -1881,7 +1881,7 @@ impl SurfnetSvm {
             };
             let mut data = bincode::serialize(&programdata_state).unwrap();
 
-            data.extend_from_slice(&include_bytes!("../tests/assets/minimum_program.so").to_vec());
+            data.extend_from_slice(crate::surfnet::noop_program::NOOP_PROGRAM_ELF);
             let lamports = self.inner.minimum_balance_for_rent_exemption(data.len());
             Some((
                 programdata_address,
@@ -3925,7 +3925,7 @@ mod tests {
             )
             .unwrap();
 
-            let mut bin = include_bytes!("../tests/assets/minimum_program.so").to_vec();
+            let mut bin = crate::surfnet::noop_program::NOOP_PROGRAM_ELF.to_vec();
             data.append(&mut bin); // push our binary after the state data
             let lamports = svm.inner.minimum_balance_for_rent_exemption(data.len());
             let default_program_data_account = Account {
