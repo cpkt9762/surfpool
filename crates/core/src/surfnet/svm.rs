@@ -1189,6 +1189,30 @@ impl SurfnetSvm {
         Ok(())
     }
 
+    /// Adds a program to the SVM using LiteSVM's add_program method.
+    /// This handles all the BPF Loader setup automatically.
+    ///
+    /// # Arguments
+    /// * `program_id` - The public key of the program to add
+    /// * `program_bytes` - The ELF bytes of the program
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error if the operation fails.
+    pub fn add_program(&mut self, program_id: &Pubkey, program_bytes: &[u8]) -> SurfpoolResult<()> {
+        self.updated_at = Utc::now().timestamp_millis() as u64;
+
+        self.inner
+            .svm.add_program(*program_id, program_bytes)
+            .map_err(|e| SurfpoolError::internal(format!("Failed to add program {}: {}", program_id, e)))?;
+
+        // Notify about the program update
+        let _ = self
+            .simnet_events_tx
+            .send(SimnetEvent::account_update(*program_id));
+        
+        Ok(())
+    }
+
     pub fn update_account_registries(
         &mut self,
         pubkey: &Pubkey,

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jsonrpc_core::{BoxFuture, Error, Result, futures::future};
 use jsonrpc_derive::rpc;
+use serde_json::json;
 use solana_account::Account;
 use solana_client::rpc_response::{RpcLogsResponse, RpcResponseContext};
 use solana_clock::Slot;
@@ -594,6 +595,33 @@ pub trait SurfnetCheatcodes {
         meta: Self::Metadata,
         limit: Option<u64>,
     ) -> BoxFuture<Result<RpcResponse<Vec<RpcLogsResponse>>>>;
+
+    /// Add a program directly to the local Surfpool network.
+    /// This method simplifies program deployment by handling BPF Loader setup automatically.
+    ///
+    /// ## Parameters
+    /// - `program_id`: The Pubkey where the program should be deployed
+    /// - `program_data`: Hex-encoded ELF binary of the program
+    ///
+    /// ## Returns
+    /// Success indicator
+    ///
+    /// ## Example Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_addProgram",
+    ///   "params": ["MEVcNzG8UQjEDr9iWWEdtFkKxwRRrZ8KbKARQJJ9qY7", "7f454c46..."]
+    /// }
+    /// ```
+    #[rpc(meta, name = "surfnet_addProgram")]
+    fn add_program(
+        &self,
+        meta: Self::Metadata,
+        program_id: String,
+        program_data: String,
+    ) -> BoxFuture<Result<bool>>;
 
     /// A cheat code to jump forward or backward in time on the local network.
     /// Useful for testing epoch-based or time-sensitive logic.
@@ -1653,6 +1681,43 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         let _ = surfnet_command_tx.send(SimnetCommand::CommandClock(key, ClockCommand::Resume));
         meta.with_svm_reader(|svm_reader| svm_reader.latest_epoch_info.clone())
             .map_err(Into::into)
+    }
+
+    fn add_program(
+        &self,
+        meta: Self::Metadata,
+        program_id: String,
+        program_data: String,
+    ) -> BoxFuture<Result<bool>> {
+        // Parse the program ID
+        let pubkey = match verify_pubkey(&program_id) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+
+        // Decode the hex-encoded program data
+        let program_bytes = match hex::decode(&program_data) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let mut error = Error::invalid_params("Invalid hex data provided");
+                error.data = Some(json!(e.to_string()));
+                return Box::pin(future::err(error));
+            }
+        };
+
+        // Get SVM locker to access the SVM
+        let svm_locker = match meta.get_svm_locker() {
+            Ok(locker) => locker,
+            Err(e) => return e.into(),
+        };
+
+        // Add the program using the SVM's built-in method
+        Box::pin(async move {
+            svm_locker.with_svm_writer(|svm_writer| {
+                svm_writer.add_program(&pubkey, &program_bytes)?;
+                Ok(true)
+            })
+        })
     }
 
     fn time_travel(
