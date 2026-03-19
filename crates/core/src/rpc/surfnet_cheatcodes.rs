@@ -601,7 +601,7 @@ pub trait SurfnetCheatcodes {
     ///
     /// ## Parameters
     /// - `program_id`: The Pubkey where the program should be deployed
-    /// - `program_data`: Hex-encoded ELF binary of the program
+    /// - `program_data`: Base64-encoded ELF binary of the program
     ///
     /// ## Returns
     /// Success indicator
@@ -612,7 +612,7 @@ pub trait SurfnetCheatcodes {
     ///   "jsonrpc": "2.0",
     ///   "id": 1,
     ///   "method": "surfnet_addProgram",
-    ///   "params": ["MEVcNzG8UQjEDr9iWWEdtFkKxwRRrZ8KbKARQJJ9qY7", "7f454c46..."]
+    ///   "params": ["MEVcNzG8UQjEDr9iWWEdtFkKxwRRrZ8KbKARQJJ9qY7", "f0VMRg..."]
     /// }
     /// ```
     #[rpc(meta, name = "surfnet_addProgram")]
@@ -1695,11 +1695,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             Err(e) => return e.into(),
         };
 
-        // Decode the hex-encoded program data
-        let program_bytes = match hex::decode(&program_data) {
+        let program_bytes = match STANDARD.decode(&program_data) {
             Ok(bytes) => bytes,
             Err(e) => {
-                let mut error = Error::invalid_params("Invalid hex data provided");
+                let mut error = Error::invalid_params("Invalid base64 data provided");
                 error.data = Some(json!(e.to_string()));
                 return Box::pin(future::err(error));
             }

@@ -84,13 +84,8 @@ pub struct SendBundleConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SimulateBundleConfig {
-    /// Skip signature verification (default: true for simulation)
-    #[serde(default = "default_true")]
-    pub skip_sig_verify: bool,
-}
-
-fn default_true() -> bool {
-    true
+    /// Transaction encoding (default: base58)
+    pub encoding: Option<String>,
 }
 
 #[derive(Clone)]
@@ -98,7 +93,10 @@ pub struct SurfpoolJitoRpc;
 
 /// Decode a list of encoded transaction strings into VersionedTransactions.
 /// Returns an error if any transaction fails to decode or if there are duplicates.
-fn decode_and_validate_bundle(transactions: &[String]) -> Result<Vec<VersionedTransaction>> {
+fn decode_and_validate_bundle(
+    transactions: &[String],
+    encoding: Option<&str>,
+) -> Result<Vec<VersionedTransaction>> {
     if transactions.is_empty() {
         return Err(Error::invalid_params("Bundle cannot be empty"));
     }
@@ -112,22 +110,22 @@ fn decode_and_validate_bundle(transactions: &[String]) -> Result<Vec<VersionedTr
 
     let mut decoded_txs = Vec::with_capacity(transactions.len());
     let mut seen_signatures = HashSet::new();
+    let encoding = match encoding {
+        Some("base64") => solana_transaction_status::TransactionBinaryEncoding::Base64,
+        Some("base58") | None => solana_transaction_status::TransactionBinaryEncoding::Base58,
+        Some(other) => {
+            return Err(Error::invalid_params(format!(
+                "Unsupported transaction encoding: {}",
+                other
+            )));
+        }
+    };
 
     for (idx, tx_data) in transactions.iter().enumerate() {
-        // Try base58 first, then base64
-        let (_, tx) = decode_and_deserialize::<VersionedTransaction>(
-            tx_data.clone(),
-            solana_transaction_status::TransactionBinaryEncoding::Base58,
-        )
-        .or_else(|_| {
-            decode_and_deserialize::<VersionedTransaction>(
-                tx_data.clone(),
-                solana_transaction_status::TransactionBinaryEncoding::Base64,
-            )
-        })
-        .map_err(|e| {
-            Error::invalid_params(format!("Failed to decode transaction {}: {}", idx, e))
-        })?;
+        let (_, tx) = decode_and_deserialize::<VersionedTransaction>(tx_data.clone(), encoding)
+            .map_err(|e| {
+                Error::invalid_params(format!("Failed to decode transaction {}: {}", idx, e))
+            })?;
 
         // Check for duplicate transactions
         let sig = tx.signatures[0];
@@ -165,7 +163,7 @@ impl Jito for SurfpoolJitoRpc {
         &self,
         meta: Self::Metadata,
         transactions: Vec<String>,
-        _config: Option<SendBundleConfig>,
+        config: Option<SendBundleConfig>,
     ) -> Result<String> {
         let Some(ctx) = &meta else {
             return Err(RpcCustomError::NodeUnhealthy {
@@ -175,63 +173,45 @@ impl Jito for SurfpoolJitoRpc {
         };
 
         // 1. Decode and validate all transactions
-        let decoded_txs = decode_and_validate_bundle(&transactions)?;
+        let decoded_txs = decode_and_validate_bundle(
+            &transactions,
+            config.as_ref().and_then(|cfg| cfg.encoding.as_deref()),
+        )?;
         let signatures: Vec<Signature> = decoded_txs.iter().map(|tx| tx.signatures[0]).collect();
 
-        // 2. Dry run on cloned SVM (atomic validation)
-        //    Uses clone_for_profiling() which wraps storage in overlay — no state leaks
-        let dry_run_results: Vec<std::result::Result<(), FailedTransactionMetadata>> =
-            ctx.svm_locker.with_svm_reader(|svm_reader| {
-                let mut svm_clone = svm_reader.clone_for_profiling();
-                let mut results = Vec::with_capacity(decoded_txs.len());
-
-                for tx in &decoded_txs {
-                    // Use send_transaction on clone to get chain-state propagation
-                    match svm_clone.inner.send_transaction(tx.clone()) {
-                        Ok(_meta) => results.push(Ok(())),
-                        Err(e) => {
-                            results.push(Err(e));
-                            break; // Stop at first failure
-                        }
-                    }
-                }
-                results
-            });
-
-        // 3. Check if dry run succeeded for ALL transactions
-        for (idx, result) in dry_run_results.iter().enumerate() {
-            if let Err(e) = result {
-                return Err(Error {
-                    code: jsonrpc_core::ErrorCode::ServerError(-32000),
-                    message: format!("Bundle rejected: transaction {} failed: {}", idx, e.err),
-                    data: Some(serde_json::json!({
-                        "transaction_index": idx,
-                        "error": e.err.to_string(),
-                        "logs": e.meta.logs,
-                    })),
-                });
-            }
-        }
-
-        // 4. All passed — now execute on the real SVM
         ctx.svm_locker.with_svm_writer(|svm_writer| {
+            let mut svm_clone = svm_writer.clone_for_profiling();
+
             for (idx, tx) in decoded_txs.iter().enumerate() {
-                if let Err(e) = svm_writer.inner.send_transaction(tx.clone()) {
-                    // This should not happen since dry run passed, but handle gracefully
+                if let Err(e) = svm_clone.inner.send_transaction(tx.clone()) {
                     return Err(Error {
-                        code: jsonrpc_core::ErrorCode::ServerError(-32001),
-                        message: format!(
-                            "Bundle commit failed unexpectedly at transaction {}: {}",
-                            idx, e.err
-                        ),
-                        data: None,
+                        code: jsonrpc_core::ErrorCode::ServerError(-32000),
+                        message: format!("Bundle rejected: transaction {} failed: {}", idx, e.err),
+                        data: Some(serde_json::json!({
+                            "transaction_index": idx,
+                            "error": e.err.to_string(),
+                            "logs": e.meta.logs,
+                        })),
                     });
                 }
             }
+
+            for tx in &decoded_txs {
+                svm_writer.inner.send_transaction(tx.clone()).map_err(
+                    |e: FailedTransactionMetadata| Error {
+                        code: jsonrpc_core::ErrorCode::ServerError(-32000),
+                        message: format!("Bundle rejected during commit: {}", e.err),
+                        data: Some(serde_json::json!({
+                            "error": e.err.to_string(),
+                            "logs": e.meta.logs,
+                        })),
+                    },
+                )?;
+            }
+
             Ok(())
         })?;
 
-        // 5. Return bundle ID
         Ok(calculate_bundle_id(&signatures))
     }
 
@@ -248,10 +228,11 @@ impl Jito for SurfpoolJitoRpc {
             .into());
         };
 
-        let _config = config.unwrap_or_default();
-
         // 1. Decode and validate
-        let decoded_txs = decode_and_validate_bundle(&transactions)?;
+        let decoded_txs = decode_and_validate_bundle(
+            &transactions,
+            config.as_ref().and_then(|cfg| cfg.encoding.as_deref()),
+        )?;
 
         // 2. Simulate on cloned SVM (no state changes to real SVM)
         let (summary, transaction_results) = ctx.svm_locker.with_svm_reader(|svm_reader| {
