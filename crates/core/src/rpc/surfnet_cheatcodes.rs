@@ -871,6 +871,13 @@ pub trait SurfnetCheatcodes {
         config: Option<ExportSnapshotConfig>,
     ) -> Result<RpcResponse<BTreeMap<String, AccountSnapshot>>>;
 
+    #[rpc(meta, name = "surfnet_loadSnapshot")]
+    fn surfnet_load_snapshot(
+        &self,
+        meta: Self::Metadata,
+        accounts: BTreeMap<String, Option<AccountSnapshot>>,
+    ) -> BoxFuture<Result<RpcResponse<u64>>>;
+
     /// A cheat code to simulate account streaming.
     /// When a transaction is processed, the accounts that are accessed are downloaded from the datasource and cached in the SVM.
     /// With this method, you can simulate the streaming of accounts by providing a pubkey.
@@ -1380,6 +1387,129 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             Ok(RpcResponse {
                 context: RpcResponseContext::new(slot),
                 value: (),
+            })
+        })
+    }
+
+    fn surfnet_load_snapshot(
+        &self,
+        meta: Self::Metadata,
+        accounts: BTreeMap<String, Option<AccountSnapshot>>,
+    ) -> BoxFuture<Result<RpcResponse<u64>>> {
+        let Some(ctx) = meta else {
+            return Box::pin(future::err(SurfpoolError::missing_context().into()));
+        };
+
+        let svm_locker = ctx.svm_locker.clone();
+        let remote_rpc_client = ctx.remote_rpc_client.clone();
+        let simnet_events_tx = svm_locker.simnet_events_tx();
+
+        Box::pin(async move {
+            let mut accounts_to_load = Vec::new();
+
+            for (pubkey_str, account_snapshot_opt) in accounts {
+                let pubkey = verify_pubkey(&pubkey_str)?;
+
+                match account_snapshot_opt {
+                    Some(account_snapshot) => {
+                        let data = STANDARD.decode(&account_snapshot.data).map_err(|e| {
+                            Error::invalid_params(format!(
+                                "failed to decode base64 data for account '{}': {}",
+                                pubkey_str, e
+                            ))
+                        })?;
+
+                        let owner = verify_pubkey(&account_snapshot.owner).map_err(|_| {
+                            Error::invalid_params(format!(
+                                "invalid owner pubkey for account '{}'",
+                                pubkey_str
+                            ))
+                        })?;
+
+                        accounts_to_load.push((
+                            pubkey,
+                            Account {
+                                lamports: account_snapshot.lamports,
+                                owner,
+                                executable: account_snapshot.executable,
+                                rent_epoch: account_snapshot.rent_epoch,
+                                data,
+                            },
+                        ));
+                    }
+                    None => {
+                        let Some(remote_rpc_client) = remote_rpc_client.as_ref() else {
+                            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
+                                "Skipping account '{}': remote RPC client not configured",
+                                pubkey_str
+                            )));
+                            continue;
+                        };
+
+                        match remote_rpc_client
+                            .get_account(&pubkey, CommitmentConfig::confirmed())
+                            .await
+                        {
+                            Ok(GetAccountResult::FoundAccount(_, account, _)) => {
+                                accounts_to_load.push((pubkey, account));
+                            }
+                            Ok(GetAccountResult::FoundProgramAccount(
+                                (program_pubkey, program_account),
+                                (data_pubkey, data_account_opt),
+                            )) => {
+                                accounts_to_load.push((program_pubkey, program_account));
+                                if let Some(data_account) = data_account_opt {
+                                    accounts_to_load.push((data_pubkey, data_account));
+                                }
+                            }
+                            Ok(GetAccountResult::FoundTokenAccount(
+                                (token_pubkey, token_account),
+                                (mint_pubkey, mint_account_opt),
+                            )) => {
+                                accounts_to_load.push((token_pubkey, token_account));
+                                if let Some(mint_account) = mint_account_opt {
+                                    accounts_to_load.push((mint_pubkey, mint_account));
+                                }
+                            }
+                            Ok(GetAccountResult::None(_)) => {
+                                let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
+                                    "Skipping account '{}': not found on remote RPC",
+                                    pubkey_str
+                                )));
+                            }
+                            Err(e) => {
+                                let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
+                                    "Skipping account '{}': failed to fetch from remote RPC: {}",
+                                    pubkey_str, e
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let slot = svm_locker.with_svm_writer(|svm| {
+                let slot = svm.get_latest_absolute_slot();
+                let mut loaded_count = 0_u64;
+
+                for (pubkey, account) in accounts_to_load {
+                    if let Err(e) = svm.set_account(&pubkey, account) {
+                        let _ = svm.simnet_events_tx.send(SimnetEvent::warn(format!(
+                            "Failed to set account '{}': {}",
+                            pubkey, e
+                        )));
+                        continue;
+                    }
+
+                    loaded_count += 1;
+                }
+
+                (slot, loaded_count)
+            });
+
+            Ok(RpcResponse {
+                context: RpcResponseContext::new(slot.0),
+                value: slot.1,
             })
         })
     }
