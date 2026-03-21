@@ -344,6 +344,98 @@ async fn inject_replay_accounts(
     Ok(())
 }
 
+async fn inject_missing_touched_accounts(
+    ctx: &RunloopContext,
+    svm_clone: &mut SurfnetSvm,
+    touched_accounts: &BTreeSet<Pubkey>,
+) -> Result<()> {
+    let missing: Vec<Pubkey> = touched_accounts
+        .iter()
+        .filter(|pk| !matches!(svm_clone.get_account(pk), Ok(Some(_))))
+        .copied()
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let Some(remote_client) = &ctx.remote_rpc_client else {
+        return Ok(());
+    };
+
+    let results = remote_client
+        .get_multiple_accounts(&missing, CommitmentConfig::processed())
+        .await
+        .map_err(|e| {
+            Error::invalid_params(format!(
+                "failed to fetch touched accounts from remote RPC: {}",
+                e
+            ))
+        })?;
+
+    for (pubkey, result) in missing.iter().zip(results) {
+        match result {
+            GetAccountResult::FoundAccount(_, account, _) => {
+                svm_clone.set_account(pubkey, account).map_err(|e| {
+                    Error::invalid_params(format!(
+                        "failed to inject touched account {}: {}",
+                        pubkey, e
+                    ))
+                })?;
+            }
+            GetAccountResult::FoundProgramAccount(
+                (program_pubkey, program_account),
+                (data_pubkey, data_account_opt),
+            ) => {
+                svm_clone
+                    .set_account(&program_pubkey, program_account)
+                    .map_err(|e| {
+                        Error::invalid_params(format!(
+                            "failed to inject touched program account {}: {}",
+                            program_pubkey, e
+                        ))
+                    })?;
+                if let Some(data_account) = data_account_opt {
+                    svm_clone
+                        .set_account(&data_pubkey, data_account)
+                        .map_err(|e| {
+                            Error::invalid_params(format!(
+                                "failed to inject touched program data account {}: {}",
+                                data_pubkey, e
+                            ))
+                        })?;
+                }
+            }
+            GetAccountResult::FoundTokenAccount(
+                (token_pubkey, token_account),
+                (mint_pubkey, mint_account_opt),
+            ) => {
+                svm_clone
+                    .set_account(&token_pubkey, token_account)
+                    .map_err(|e| {
+                        Error::invalid_params(format!(
+                            "failed to inject touched token account {}: {}",
+                            token_pubkey, e
+                        ))
+                    })?;
+                if let Some(mint_account) = mint_account_opt {
+                    svm_clone
+                        .set_account(&mint_pubkey, mint_account)
+                        .map_err(|e| {
+                            Error::invalid_params(format!(
+                                "failed to inject touched mint account {}: {}",
+                                mint_pubkey, e
+                            ))
+                        })?;
+                }
+            }
+            GetAccountResult::None(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
 fn apply_replay_clock(svm_clone: &mut SurfnetSvm, config: &ReplayBundleConfig) {
     let slots_in_epoch = svm_clone
         .latest_epoch_info
@@ -544,6 +636,7 @@ impl Jito for SurfpoolJitoRpc {
                 .with_svm_writer(|svm_writer| svm_writer.clone_for_profiling());
 
             inject_replay_accounts(&ctx, &mut svm_clone, &config).await?;
+            inject_missing_touched_accounts(&ctx, &mut svm_clone, &touched_accounts).await?;
             apply_replay_clock(&mut svm_clone, &config);
 
             let mut before_accounts = Vec::with_capacity(touched_accounts.len());
