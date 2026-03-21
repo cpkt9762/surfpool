@@ -1145,6 +1145,35 @@ impl AccountSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayBundleConfig {
+    pub accounts: BTreeMap<String, Option<AccountSnapshot>>,
+    pub slot: u64,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayBundleResult {
+    pub success: bool,
+    pub transactions: Vec<ReplayTxResult>,
+    pub account_diffs: Vec<AccountDiff>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayTxResult {
+    pub signature: String,
+    pub success: bool,
+    pub error: Option<String>,
+    pub logs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountDiff {
+    pub address: String,
+    pub before: Option<AccountSnapshot>,
+    pub after: Option<AccountSnapshot>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportSnapshotConfig {

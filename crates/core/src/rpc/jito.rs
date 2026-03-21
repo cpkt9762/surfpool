@@ -1,15 +1,29 @@
-use std::collections::HashSet;
+use std::{
+    collections::{BTreeSet, HashSet},
+    str::FromStr,
+};
 
-use jsonrpc_core::{Error, Result};
+use base64::{Engine, prelude::BASE64_STANDARD};
+use jsonrpc_core::{BoxFuture, Error, Result};
 use jsonrpc_derive::rpc;
 use litesvm::types::FailedTransactionMetadata;
 use serde::{Deserialize, Serialize};
+use solana_account::Account;
 use solana_client::rpc_custom_error::RpcCustomError;
+use solana_clock::Clock;
+use solana_commitment_config::CommitmentConfig;
+use solana_pubkey::Pubkey;
+use solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext};
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
+use surfpool_types::{
+    AccountDiff, AccountSnapshot, ReplayBundleConfig, ReplayBundleResult, ReplayTxResult,
+};
 
 use super::RunloopContext;
 use crate::rpc::utils::decode_and_deserialize;
+use crate::surfnet::svm::SurfnetSvm;
+use crate::surfnet::{GetAccountResult, SLOTS_PER_EPOCH};
 
 /// Maximum number of transactions allowed in a single bundle (matches Jito-Solana)
 const MAX_TRANSACTIONS_PER_BUNDLE: usize = 5;
@@ -74,6 +88,14 @@ pub trait Jito {
         transactions: Vec<String>,
         config: Option<SimulateBundleConfig>,
     ) -> Result<RpcSimulateBundleResult>;
+
+    #[rpc(meta, name = "surfnet_replayBundle")]
+    fn surfnet_replay_bundle(
+        &self,
+        meta: Self::Metadata,
+        transactions: Vec<String>,
+        config: ReplayBundleConfig,
+    ) -> BoxFuture<Result<RpcResponse<ReplayBundleResult>>>;
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -154,6 +176,230 @@ fn calculate_bundle_id(signatures: &[Signature]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(concatenated.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn decode_base64_transactions(transactions: &[String]) -> Result<Vec<VersionedTransaction>> {
+    if transactions.is_empty() {
+        return Err(Error::invalid_params("Bundle cannot be empty"));
+    }
+
+    let mut decoded_txs = Vec::with_capacity(transactions.len());
+    for (idx, tx_data) in transactions.iter().enumerate() {
+        let (_, tx) = decode_and_deserialize::<VersionedTransaction>(
+            tx_data.clone(),
+            solana_transaction_status::TransactionBinaryEncoding::Base64,
+        )
+        .map_err(|e| {
+            Error::invalid_params(format!("Failed to decode transaction {}: {}", idx, e))
+        })?;
+        decoded_txs.push(tx);
+    }
+
+    Ok(decoded_txs)
+}
+
+fn decode_snapshot_account(snapshot: &AccountSnapshot) -> Result<Account> {
+    let data = BASE64_STANDARD.decode(&snapshot.data).map_err(|e| {
+        Error::invalid_params(format!(
+            "failed to decode account data for replay snapshot: {e}"
+        ))
+    })?;
+    let owner = Pubkey::from_str(&snapshot.owner).map_err(|e| {
+        Error::invalid_params(format!("invalid owner pubkey in replay snapshot: {e}"))
+    })?;
+
+    Ok(Account {
+        lamports: snapshot.lamports,
+        data,
+        owner,
+        executable: snapshot.executable,
+        rent_epoch: snapshot.rent_epoch,
+    })
+}
+
+fn encode_account_snapshot(account: &Account) -> AccountSnapshot {
+    AccountSnapshot::new(
+        account.lamports,
+        account.owner.to_string(),
+        account.executable,
+        account.rent_epoch,
+        BASE64_STANDARD.encode(&account.data),
+        None,
+    )
+}
+
+fn capture_account_snapshot(svm: &SurfnetSvm, pubkey: &Pubkey) -> Result<Option<AccountSnapshot>> {
+    svm.get_account(pubkey)
+        .map(|account| account.as_ref().map(encode_account_snapshot))
+        .map_err(|e| {
+            Error::invalid_params(format!("failed to read replay account {}: {}", pubkey, e))
+        })
+}
+
+async fn inject_replay_accounts(
+    ctx: &RunloopContext,
+    svm_clone: &mut SurfnetSvm,
+    config: &ReplayBundleConfig,
+) -> Result<()> {
+    let mut missing_remote_pubkeys = Vec::new();
+
+    for (address, snapshot) in &config.accounts {
+        let pubkey = Pubkey::from_str(address).map_err(|e| {
+            Error::invalid_params(format!("invalid replay account pubkey {}: {}", address, e))
+        })?;
+
+        if let Some(snapshot) = snapshot {
+            let account = decode_snapshot_account(snapshot)?;
+            svm_clone.set_account(&pubkey, account).map_err(|e| {
+                Error::invalid_params(format!(
+                    "failed to inject replay account {}: {}",
+                    address, e
+                ))
+            })?;
+        } else {
+            missing_remote_pubkeys.push(pubkey);
+        }
+    }
+
+    if missing_remote_pubkeys.is_empty() {
+        return Ok(());
+    }
+
+    let Some(remote_client) = &ctx.remote_rpc_client else {
+        return Err(Error::invalid_params(
+            "replay bundle requires remote_rpc_client for null account snapshots",
+        ));
+    };
+
+    let remote_results = remote_client
+        .get_multiple_accounts(&missing_remote_pubkeys, CommitmentConfig::processed())
+        .await
+        .map_err(|e| {
+            Error::invalid_params(format!(
+                "failed to fetch replay accounts from remote RPC: {}",
+                e
+            ))
+        })?;
+
+    for (pubkey, result) in missing_remote_pubkeys.iter().zip(remote_results) {
+        match result {
+            GetAccountResult::FoundAccount(_, account, _) => {
+                svm_clone.set_account(pubkey, account).map_err(|e| {
+                    Error::invalid_params(format!(
+                        "failed to inject remote replay account {}: {}",
+                        pubkey, e
+                    ))
+                })?;
+            }
+            GetAccountResult::FoundProgramAccount(
+                (program_pubkey, program_account),
+                (data_pubkey, data_account_opt),
+            ) => {
+                svm_clone
+                    .set_account(&program_pubkey, program_account)
+                    .map_err(|e| {
+                        Error::invalid_params(format!(
+                            "failed to inject remote replay account {}: {}",
+                            program_pubkey, e
+                        ))
+                    })?;
+                if let Some(data_account) = data_account_opt {
+                    svm_clone
+                        .set_account(&data_pubkey, data_account)
+                        .map_err(|e| {
+                            Error::invalid_params(format!(
+                                "failed to inject remote replay account {}: {}",
+                                data_pubkey, e
+                            ))
+                        })?;
+                }
+            }
+            GetAccountResult::FoundTokenAccount(
+                (token_pubkey, token_account),
+                (mint_pubkey, mint_account_opt),
+            ) => {
+                svm_clone
+                    .set_account(&token_pubkey, token_account)
+                    .map_err(|e| {
+                        Error::invalid_params(format!(
+                            "failed to inject remote replay account {}: {}",
+                            token_pubkey, e
+                        ))
+                    })?;
+                if let Some(mint_account) = mint_account_opt {
+                    svm_clone
+                        .set_account(&mint_pubkey, mint_account)
+                        .map_err(|e| {
+                            Error::invalid_params(format!(
+                                "failed to inject remote replay account {}: {}",
+                                mint_pubkey, e
+                            ))
+                        })?;
+                }
+            }
+            GetAccountResult::None(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_replay_clock(svm_clone: &mut SurfnetSvm, config: &ReplayBundleConfig) {
+    let slots_in_epoch = svm_clone
+        .latest_epoch_info
+        .slots_in_epoch
+        .max(SLOTS_PER_EPOCH);
+    let epoch = config.slot / slots_in_epoch;
+    let slot_index = config.slot % slots_in_epoch;
+    let clock = Clock {
+        slot: slot_index,
+        epoch,
+        unix_timestamp: config.timestamp,
+        epoch_start_timestamp: 0,
+        leader_schedule_epoch: 0,
+    };
+
+    svm_clone.inner.set_sysvar(&clock);
+    svm_clone.updated_at = config.timestamp.max(0) as u64 * 1_000;
+    svm_clone.latest_epoch_info.epoch = epoch;
+    svm_clone.latest_epoch_info.slot_index = slot_index;
+    svm_clone.latest_epoch_info.absolute_slot = config.slot;
+}
+
+async fn collect_touched_accounts(
+    ctx: &RunloopContext,
+    transactions: &[VersionedTransaction],
+    config: &ReplayBundleConfig,
+) -> Result<BTreeSet<Pubkey>> {
+    let mut touched_accounts = BTreeSet::new();
+
+    for address in config.accounts.keys() {
+        touched_accounts.insert(Pubkey::from_str(address).map_err(|e| {
+            Error::invalid_params(format!("invalid replay account pubkey {}: {}", address, e))
+        })?);
+    }
+
+    let remote_ctx = ctx
+        .remote_rpc_client
+        .clone()
+        .map(|client| (client, CommitmentConfig::processed()));
+
+    for tx in transactions {
+        touched_accounts.extend(tx.message.static_account_keys().iter().copied());
+
+        if let Some(loaded_addresses) = ctx
+            .svm_locker
+            .get_loaded_addresses(&remote_ctx, &tx.message)
+            .await
+            .map_err(|e| {
+                Error::invalid_params(format!("failed to resolve replay ALT addresses: {}", e))
+            })?
+        {
+            touched_accounts.extend(loaded_addresses.all_loaded_addresses().into_iter().copied());
+        }
+    }
+
+    Ok(touched_accounts)
 }
 
 impl Jito for SurfpoolJitoRpc {
@@ -276,13 +522,93 @@ impl Jito for SurfpoolJitoRpc {
             transaction_results,
         })
     }
+
+    fn surfnet_replay_bundle(
+        &self,
+        meta: Self::Metadata,
+        transactions: Vec<String>,
+        config: ReplayBundleConfig,
+    ) -> BoxFuture<Result<RpcResponse<ReplayBundleResult>>> {
+        Box::pin(async move {
+            let Some(ctx) = meta else {
+                return Err(RpcCustomError::NodeUnhealthy {
+                    num_slots_behind: None,
+                }
+                .into());
+            };
+
+            let decoded_txs = decode_base64_transactions(&transactions)?;
+            let touched_accounts = collect_touched_accounts(&ctx, &decoded_txs, &config).await?;
+            let mut svm_clone = ctx
+                .svm_locker
+                .with_svm_writer(|svm_writer| svm_writer.clone_for_profiling());
+
+            inject_replay_accounts(&ctx, &mut svm_clone, &config).await?;
+            apply_replay_clock(&mut svm_clone, &config);
+
+            let mut before_accounts = Vec::with_capacity(touched_accounts.len());
+            for pubkey in &touched_accounts {
+                before_accounts.push((*pubkey, capture_account_snapshot(&svm_clone, pubkey)?));
+            }
+
+            let mut tx_results = Vec::with_capacity(decoded_txs.len());
+            let mut all_succeeded = true;
+            for tx in decoded_txs {
+                let signature =
+                    tx.signatures
+                        .first()
+                        .map(ToString::to_string)
+                        .ok_or_else(|| {
+                            Error::invalid_params("replay bundle transaction missing signature")
+                        })?;
+
+                match svm_clone.send_transaction(tx, false, false) {
+                    Ok(metadata) => tx_results.push(ReplayTxResult {
+                        signature,
+                        success: true,
+                        error: None,
+                        logs: metadata.logs,
+                    }),
+                    Err(err) => {
+                        all_succeeded = false;
+                        tx_results.push(ReplayTxResult {
+                            signature,
+                            success: false,
+                            error: Some(err.err.to_string()),
+                            logs: err.meta.logs,
+                        });
+                        break;
+                    }
+                }
+            }
+
+            let mut account_diffs = Vec::with_capacity(before_accounts.len());
+            for (pubkey, before) in before_accounts {
+                let after = capture_account_snapshot(&svm_clone, &pubkey)?;
+                account_diffs.push(AccountDiff {
+                    address: pubkey.to_string(),
+                    before,
+                    after,
+                });
+            }
+
+            Ok(RpcResponse {
+                context: RpcResponseContext::new(config.slot),
+                value: ReplayBundleResult {
+                    success: all_succeeded,
+                    transactions: tx_results,
+                    account_diffs,
+                },
+            })
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use sha2::{Digest, Sha256};
     use solana_keypair::Keypair;
-    use solana_message::{v0::Message as V0Message, VersionedMessage};
+    use solana_message::{VersionedMessage, v0::Message as V0Message};
     use solana_pubkey::Pubkey;
     use solana_signer::Signer;
     use solana_system_interface::instruction as system_instruction;
