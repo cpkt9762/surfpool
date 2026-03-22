@@ -295,24 +295,24 @@ async fn inject_replay_accounts(
                 (program_pubkey, program_account),
                 (data_pubkey, data_account_opt),
             ) => {
-                svm_clone
-                    .set_account(&program_pubkey, program_account)
-                    .map_err(|e| {
-                        Error::invalid_params(format!(
-                            "failed to inject remote replay account {}: {}",
-                            program_pubkey, e
-                        ))
-                    })?;
                 if let Some(data_account) = data_account_opt {
                     svm_clone
                         .set_account(&data_pubkey, data_account)
                         .map_err(|e| {
                             Error::invalid_params(format!(
-                                "failed to inject remote replay account {}: {}",
+                                "failed to inject remote replay program data account {}: {}",
                                 data_pubkey, e
                             ))
                         })?;
                 }
+                svm_clone
+                    .set_account(&program_pubkey, program_account)
+                    .map_err(|e| {
+                        Error::invalid_params(format!(
+                            "failed to inject remote replay program account {}: {}",
+                            program_pubkey, e
+                        ))
+                    })?;
             }
             GetAccountResult::FoundTokenAccount(
                 (token_pubkey, token_account),
@@ -387,14 +387,8 @@ async fn inject_missing_touched_accounts(
                 (program_pubkey, program_account),
                 (data_pubkey, data_account_opt),
             ) => {
-                svm_clone
-                    .set_account(&program_pubkey, program_account)
-                    .map_err(|e| {
-                        Error::invalid_params(format!(
-                            "failed to inject touched program account {}: {}",
-                            program_pubkey, e
-                        ))
-                    })?;
+                // programdata must be injected BEFORE program account
+                // (LiteSVM validates the programdata reference on set_account for BPFUpgradeableLoader)
                 if let Some(data_account) = data_account_opt {
                     svm_clone
                         .set_account(&data_pubkey, data_account)
@@ -405,6 +399,14 @@ async fn inject_missing_touched_accounts(
                             ))
                         })?;
                 }
+                svm_clone
+                    .set_account(&program_pubkey, program_account)
+                    .map_err(|e| {
+                        Error::invalid_params(format!(
+                            "failed to inject touched program account {}: {}",
+                            program_pubkey, e
+                        ))
+                    })?;
             }
             GetAccountResult::FoundTokenAccount(
                 (token_pubkey, token_account),
